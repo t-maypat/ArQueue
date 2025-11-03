@@ -1,7 +1,7 @@
 import dotenv from 'dotenv';
 import { Redis } from 'ioredis';
 import express from 'express';
-import { console } from './console';
+import { logger } from './logger';
 import { fileURLToPath } from 'url';
 import path from 'path';
 import { randomUUID } from 'crypto';
@@ -19,9 +19,9 @@ const CONCURRENCY = Number(process.env.WORKER_CONCURRENCY || 3);
 const BRPOP_TIMEOUT = Number(process.env.BRPOP_TIMEOUT || 1); // seconds
 
 const redis = new Redis(REDIS_URL);
-redis.on('error', err => console.error({ err }, 'redis_error'));
-redis.on('connect', () => console.info('redis_connected'));
-redis.on('reconnecting', () => console.warn('redis_reconnecting'));
+redis.on('error', err => logger.error({ err }, 'redis_error'));
+redis.on('connect', () => logger.info('redis_connected'));
+redis.on('reconnecting', () => logger.warn('redis_reconnecting'));
 
 interface Task {
   id?: string;
@@ -58,13 +58,13 @@ async function processTask(t: Task) {
   ensureTaskDefaults(t);
   switch (t.type) {
     case 'send_email': {
-      console.info({ taskId: t.id, to: t.payload['to'], subject: t.payload['subject'] }, 'processing_send_email');
+      logger.info({ taskId: t.id, to: t.payload['to'], subject: t.payload['subject'] }, 'processing_send_email');
       // simulate io bound work
       await sleep(50);
       return;
     }
     case 'generate_pdf': {
-      console.info({ taskId: t.id }, 'processing_generate_pdf');
+      logger.info({ taskId: t.id }, 'processing_generate_pdf');
       await sleep(25);
       return;
     }
@@ -98,7 +98,7 @@ function backoffMs(retryCount: number, base = 2000, max = 60_000, jitterRatio = 
 
 // Worker loop - each loop competes for tasks
 async function workerLoop(loopId: number) {
-  console.info({ loopId }, 'worker_loop_start');
+  logger.info({ loopId }, 'worker_loop_start');
   activeLoops.add(loopId);
 
   while (running) {
@@ -111,7 +111,7 @@ async function workerLoop(loopId: number) {
       try {
         task = JSON.parse(raw);
       } catch (e) {
-        console.error({ loopId, raw }, 'invalid_json_in_pending');
+        logger.error({ loopId, raw }, 'invalid_json_in_pending');
         // remove the junk item from processing if present
         await redis.lrem('queue:processing', 1, raw);
         continue;
@@ -129,7 +129,7 @@ async function workerLoop(loopId: number) {
           data: raw
         });
       } catch (e) {
-        console.warn({ loopId, taskId: task.id, err: e }, 'failed_setting_task_hash');
+        logger.warn({ loopId, taskId: task.id, err: e }, 'failed_setting_task_hash');
       }
 
       // Process
@@ -162,12 +162,12 @@ async function workerLoop(loopId: number) {
         jobsDoneLocal += 1;
         await redis.incr('metrics:jobs_done');
 
-        console.info({ loopId, taskId: task.id, correlationId: task.correlationId, latencyMs }, 'task_completed');
+        logger.info({ loopId, taskId: task.id, correlationId: task.correlationId, latencyMs }, 'task_completed');
       } catch (err) {
         // Failure path
         jobsFailedLocal += 1;
         const errMsg = (err instanceof Error) ? err.message : String(err);
-        console.error({ loopId, taskId: task.id, err: errMsg }, 'task_processor_error');
+        logger.error({ loopId, taskId: task.id, err: errMsg }, 'task_processor_error');
 
         // Update retries in hash atomically
         const newRetries = await redis.hincrby(taskKey, 'retries', 1);
@@ -196,7 +196,7 @@ async function workerLoop(loopId: number) {
 
           // Update 'data' in hash to latest serialized form for visibility
           await redis.hset(taskKey, 'data', serialized, 'status', 'scheduled');
-          console.warn({ loopId, taskId: task.id, retries: newRetries }, 'scheduled_retry');
+          logger.warn({ loopId, taskId: task.id, retries: newRetries }, 'scheduled_retry');
         } else {
           // Exhausted - move to DLQ
           const exhaustedTask = {
@@ -212,27 +212,27 @@ async function workerLoop(loopId: number) {
 
           // Trigger AI analysis asynchronously
           analyzeFailure(redis, exhaustedTask).catch(err =>
-            console.error({ err, taskId: task.id }, 'ai_analysis_failed')
+            logger.error({ err, taskId: task.id }, 'ai_analysis_failed')
           );
 
-          console.error({ loopId, taskId: task.id }, 'moved_to_dlq');
+          logger.error({ loopId, taskId: task.id }, 'moved_to_dlq');
         }
       }
     } catch (err) {
-      console.error({ loopId, err }, 'worker_loop_error');
+      logger.error({ loopId, err }, 'worker_loop_error');
       // small backoff to avoid tight error loops
       await sleep(250);
     }
   }
 
   activeLoops.delete(loopId);
-  console.info({ loopId }, 'worker_loop_exit');
+  logger.info({ loopId }, 'worker_loop_exit');
 }
 
 // spawn multiple loops (concurrency)
 for (let i = 0; i < CONCURRENCY; i++) {
   // fire and forget each loop; errors are logged inside
-  workerLoop(i).catch(err => console.error({ loopId: i, err }, 'loop_crashed'));
+  workerLoop(i).catch(err => logger.error({ loopId: i, err }, 'loop_crashed'));
 }
 
 // Minimal HTTP server for metrics and DLQ inspection
@@ -292,7 +292,7 @@ app.get('/metrics', async (_req, res) => {
       latency
     });
   } catch (err) {
-    console.error({ err }, 'metrics_error');
+    logger.error({ err }, 'metrics_error');
     res.status(500).json({ error: 'metrics_error' });
   }
 });
@@ -306,7 +306,7 @@ app.get('/dead_letter', async (req, res) => {
     });
     res.json(parsed);
   } catch (err) {
-    console.error({ err }, 'dead_letter_error');
+    logger.error({ err }, 'dead_letter_error');
     res.status(500).json({ error: 'dead_letter_error' });
   }
 });
@@ -330,7 +330,7 @@ app.get('/pressure', async (_req, res) => {
       recommendation: score > 80 ? 'throttle' : 'proceed'
     });
   } catch (err) {
-    console.error({ err }, 'pressure_error');
+    logger.error({ err }, 'pressure_error');
     res.status(500).json({ error: 'pressure_error' });
   }
 });
@@ -342,7 +342,7 @@ setInterval(async () => {
     const score = await calculatePressure();
     await redis.set('backpressure:score', String(score), 'EX', 10);
   } catch (err) {
-    console.error({ err }, 'pressure_update_error');
+    logger.error({ err }, 'pressure_update_error');
   }
 }, 5000);
 
@@ -369,7 +369,7 @@ app.get('/dead_letter/:taskId/analysis', async (req, res) => {
       aiLatencyMs: parseInt(analysis.aiLatencyMs)
     });
   } catch (err) {
-    console.error({ err }, 'ai_analysis_get_error');
+    logger.error({ err }, 'ai_analysis_get_error');
     res.status(500).json({ error: 'ai_analysis_get_error' });
   }
 });
@@ -396,7 +396,7 @@ app.get('/ai/patterns', async (req, res) => {
       }
     });
   } catch (err) {
-    console.error({ err }, 'ai_patterns_error');
+    logger.error({ err }, 'ai_patterns_error');
     res.status(500).json({ error: 'ai_patterns_error' });
   }
 });
@@ -407,13 +407,13 @@ try {
   const __dirname = path.dirname(__filename);
   const dashboardDir = path.resolve(__dirname, '../../dashboard');
   app.use(express.static(dashboardDir));
-  console.info({ dashboardDir }, 'serving_dashboard');
+  logger.info({ dashboardDir }, 'serving_dashboard');
 } catch (e) {
-  console.warn('dashboard_not_found');
+  logger.warn('dashboard_not_found');
 }
 
 const server = app.listen(PORT, () => {
-  console.info({ port: PORT }, 'worker_http_listening');
+  logger.info({ port: PORT }, 'worker_http_listening');
 });
 
 // delay mover: move due jobs from delayed -> pending
@@ -426,12 +426,12 @@ async function processDelayedBatch(limit = 100) {
     await redis.rpush('queue:pending', raw);
     await redis.zrem('queue:delayed', raw);
   }
-  console.info({ moved: items.length }, 'delayed_to_pending');
+  logger.info({ moved: items.length }, 'delayed_to_pending');
 }
 
 setInterval(() => {
   if (!running) return;
-  processDelayedBatch().catch(err => console.error({ err }, 'processDelayed_error'));
+  processDelayedBatch().catch(err => logger.error({ err }, 'processDelayed_error'));
 }, DELAYED_SCAN_INTERVAL_MS);
 
 // processing recovery - use hash metadata to decide staleness
@@ -496,17 +496,17 @@ async function recoverProcessing(limit = 1000) {
   }
 
   if (recovered || sentToDlq) {
-    console.warn({ recovered, sentToDlq, timeout }, 'recover_processing_results');
+    logger.warn({ recovered, sentToDlq, timeout }, 'recover_processing_results');
   }
 }
 
 setInterval(() => {
-  recoverProcessing().catch(err => console.error({ err }, 'recoverProcessing_error'));
+  recoverProcessing().catch(err => logger.error({ err }, 'recoverProcessing_error'));
 }, PROCESSING_SCAN_INTERVAL_MS);
 
 // graceful shutdown
 async function shutdown(signal: string) {
-  console.info({ signal }, 'shutdown_initiated');
+  logger.info({ signal }, 'shutdown_initiated');
   running = false;
 
   // wait for loops to exit (they check running)
@@ -518,12 +518,12 @@ async function shutdown(signal: string) {
         await redis.quit();
       } catch { try { redis.disconnect(); } catch {} }
       server.close(() => {
-        console.info('http_closed');
+        logger.info('http_closed');
         process.exit(0);
       });
     } else if ((Date.now() - t0) > 30_000) {
       // forced exit after 30s
-      console.warn('forced_exit_timeout');
+      logger.warn('forced_exit_timeout');
       try { await redis.disconnect(); } catch {}
       process.exit(1);
     }

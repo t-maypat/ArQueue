@@ -4,7 +4,7 @@ import { Redis } from 'ioredis';
 import rateLimit from 'express-rate-limit';
 import { z } from 'zod';
 import { randomUUID } from 'crypto';
-import { console } from './console';
+import { logger } from './logger';
 
 dotenv.config();
 
@@ -25,9 +25,9 @@ const PORT = Number(process.env.PORT_PRODUCER || 8080);
 
 const redis = new Redis(REDIS_URL);
 
-redis.on('error', err => console.error({ err }, 'redis_error'));
-redis.on('connect', () => console.info('redis_connect'));
-redis.on('reconnecting', () => console.warn('redis_reconnecting'));
+redis.on('error', err => logger.error({ err }, 'redis_error'));
+redis.on('connect', () => logger.info('redis_connect'));
+redis.on('reconnecting', () => logger.warn('redis_reconnecting'));
 
 app.get('/healthz', (_req, res) => res.status(200).json({ status: 'ok' }));
 
@@ -72,7 +72,7 @@ app.post('/enqueue', limiter, async (req, res) => {
       const existingTaskId = await redis.get(`idempotency:${parsed.idempotencyKey}`);
       if (existingTaskId) {
         const existingTask = await redis.hgetall(`task:${existingTaskId}`);
-        console.info({ taskId: existingTaskId, idempotencyKey: parsed.idempotencyKey }, 'idempotent_hit');
+        logger.info({ taskId: existingTaskId, idempotencyKey: parsed.idempotencyKey }, 'idempotent_hit');
         return res.status(200).json({
           taskId: existingTaskId,
           status: existingTask.status || 'unknown',
@@ -138,14 +138,14 @@ app.post('/enqueue', limiter, async (req, res) => {
     
     const len = await redis.rpush('queue:pending', raw);
 
-    console.info({ taskId: id, type: task.type, requestId: (req as any).requestId }, 'task_enqueued');
+    logger.info({ taskId: id, type: task.type, requestId: (req as any).requestId }, 'task_enqueued');
 
     // increment a global counter (we can aggregate across processes)
     await redis.incr('metrics:jobs_enqueued');
 
     res.status(201).json({ taskId: id, queueLength: len, requestId: (req as any).requestId });
   } catch (err) {
-    console.error({ err }, 'enqueue_error');
+    logger.error({ err }, 'enqueue_error');
     if (err instanceof z.ZodError) {
       return res.status(400).json({ error: err.errors.map(e => e.message).join('; ') });
     }
@@ -153,16 +153,16 @@ app.post('/enqueue', limiter, async (req, res) => {
   }
 });
 
-const server = app.listen(PORT, () => console.info({ port: PORT }, 'producer_listening'));
+const server = app.listen(PORT, () => logger.info({ port: PORT }, 'producer_listening'));
 
 async function shutdown(signal: string) {
   try {
-    console.info({ signal }, 'producer_shutting_down');
-    server.close(() => console.info('producer_http_closed'));
+    logger.info({ signal }, 'producer_shutting_down');
+    server.close(() => logger.info('producer_http_closed'));
     await redis.quit();
     process.exit(0);
   } catch (e) {
-    console.error({ e }, 'error during shutdown');
+    logger.error({ e }, 'error during shutdown');
     process.exit(1);
   }
 }
