@@ -1,0 +1,25 @@
+{
+  "name": "arqueue-benchmark",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "benchmark": "tsx src/index.ts",
+    "throughput": "tsx src/index.ts throughput",
+    "latency": "tsx src/index.ts latency",
+    "burst": "tsx src/index.ts burst",
+    "chaos": "tsx src/index.ts chaos",
+    "build": "tsup src/index.ts --format esm --clean"
+  },
+  "dependencies": {
+    "chalk": "^5.3.0",
+    "commander": "^12.0.0",
+    "ioredis": "^5.4.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.30",
+    "tsup": "^8.5.1",
+    "tsx": "^4.16.2",
+    "typescript": "^5.6.3"
+  }
+}
