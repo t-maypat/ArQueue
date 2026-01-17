@@ -6,7 +6,6 @@
     "allowSyntheticDefaultImports": true,
     "lib": ["ES2022"],
     "types": ["node"],
-    "ignoreDeprecations": "6.0",
     "outDir": "dist",
     "rootDir": "src",
     "strict": true,
