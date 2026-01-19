@@ -37,7 +37,8 @@ app.get('/healthz', (_req, res) => res.status(200).json({ status: 'ok' }));
 const TaskSchema = z.object({
   type: z.string().nonempty(),
   payload: z.record(z.any()),
-  maxRetries: z.number().int().min(0).max(50).optional()
+  maxRetries: z.number().int().min(0).max(50).optional(),
+  idempotencyKey: z.string().max(255).optional()
 });
 
 function isRecord(v: unknown): v is Record<string, unknown> {
@@ -52,10 +53,39 @@ const limiter = rateLimit({
   handler: (_req, res) => res.status(429).json({ error: 'Too many requests' })
 });
 
+const BACKPRESSURE_THRESHOLD = Number(process.env.BACKPRESSURE_THRESHOLD || 80);
+
 // Enqueue API
 app.post('/enqueue', limiter, async (req, res) => {
   try {
     const parsed = TaskSchema.parse(req.body);
+
+    // Backpressure check
+    const pressureScore = Number(await redis.get('backpressure:score') || 0);
+    if (pressureScore >= BACKPRESSURE_THRESHOLD) {
+      return res.status(503).json({
+        error: 'Service temporarily unavailable',
+        reason: 'backpressure',
+        pressure: pressureScore,
+        retryAfterMs: 5000
+      });
+    }
+
+    // Idempotency check
+    if (parsed.idempotencyKey) {
+      const existingTaskId = await redis.get(`idempotency:${parsed.idempotencyKey}`);
+      if (existingTaskId) {
+        const existingTask = await redis.hgetall(`task:${existingTaskId}`);
+        logger.info({ taskId: existingTaskId, idempotencyKey: parsed.idempotencyKey }, 'idempotent_hit');
+        return res.status(200).json({
+          taskId: existingTaskId,
+          status: existingTask.status || 'unknown',
+          idempotent: true,
+          message: 'Task already exists with this idempotency key',
+          requestId: (req as any).requestId
+        });
+      }
+    }
 
     // Example per-type payload check
     if (parsed.type === 'send_email') {
@@ -65,13 +95,36 @@ app.post('/enqueue', limiter, async (req, res) => {
     }
 
     const id = randomUUID();
+
+    // Store idempotency mapping (before enqueue for atomicity)
+    if (parsed.idempotencyKey) {
+      const wasSet = await redis.setnx(`idempotency:${parsed.idempotencyKey}`, id);
+      if (!wasSet) {
+        // Race condition - another request won, return that task
+        const existingTaskId = await redis.get(`idempotency:${parsed.idempotencyKey}`);
+        if (existingTaskId) {
+          const existingTask = await redis.hgetall(`task:${existingTaskId}`);
+          return res.status(200).json({
+            taskId: existingTaskId,
+            status: existingTask.status || 'unknown',
+            idempotent: true,
+            requestId: (req as any).requestId
+          });
+        }
+      }
+      // Set TTL on idempotency key (24 hours)
+      await redis.expire(`idempotency:${parsed.idempotencyKey}`, 86400);
+    }
+
     const task = {
       id,
       type: parsed.type,
       payload: parsed.payload,
       retries: 0,
       maxRetries: parsed.maxRetries ?? Number(process.env.WORKER_MAX_RETRIES ?? 3),
-      createdAt: Date.now()
+      createdAt: Date.now(),
+      correlationId: (req as any).requestId,
+      idempotencyKey: parsed.idempotencyKey
     };
 
     const raw = JSON.stringify(task);
