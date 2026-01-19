@@ -5,6 +5,7 @@ import { logger } from './logger.js';
 import { fileURLToPath } from 'url';
 import path from 'path';
 import { randomUUID } from 'crypto';
+import { analyzeFailure } from './ai/analyzer.js';
 
 dotenv.config();
 
@@ -32,6 +33,7 @@ interface Task {
   lastError?: string | null;
   createdAt?: number;
   startedAt?: number | null;
+  correlationId?: string;
 }
 
 let running = true;
@@ -59,13 +61,13 @@ async function processTask(t: Task) {
   switch (t.type) {
     case 'send_email': {
       logger.info({ taskId: t.id, to: t.payload['to'], subject: t.payload['subject'] }, 'processing_send_email');
-      // simulate I/O-bound work
-      await sleep(200);
+      // simulate I/O-bound work (reduced for benchmarking)
+      await sleep(50);
       return;
     }
     case 'generate_pdf': {
       logger.info({ taskId: t.id }, 'processing_generate_pdf');
-      await sleep(100);
+      await sleep(25);
       return;
     }
     default:
@@ -83,7 +85,8 @@ function serializeTask(t: Task) {
     maxRetries: t.maxRetries,
     createdAt: t.createdAt,
     lastError: t.lastError,
-    startedAt: t.startedAt
+    startedAt: t.startedAt,
+    correlationId: t.correlationId
   });
 }
 
@@ -138,14 +141,30 @@ async function workerLoop(loopId: number) {
         // remove from processing list
         await redis.lrem('queue:processing', 1, raw);
 
+        // Calculate latency and mark completed
+        const completedAt = Date.now();
+        const latencyMs = task.createdAt ? completedAt - task.createdAt : 0;
+
         // mark completed in hash and set TTL for cleanup
-        await redis.hset(taskKey, 'status', 'completed', 'completedAt', String(Date.now()));
+        await redis.hset(taskKey, 'status', 'completed', 'completedAt', String(completedAt), 'latencyMs', String(latencyMs));
         await redis.expire(taskKey, 7 * 24 * 60 * 60); // 7 days
+
+        // Store latency sample for percentile calculation
+        if (latencyMs > 0) {
+          await redis.lpush('latency:samples', String(latencyMs));
+          await redis.ltrim('latency:samples', 0, 9999); // Keep last 10k samples
+        }
+
+        // Track benchmark completion if active
+        const benchmarkRunId = await redis.get('benchmark:active_run');
+        if (benchmarkRunId && task.id) {
+          await redis.sadd(`benchmark:completed:${benchmarkRunId}`, task.id);
+        }
 
         jobsDoneLocal += 1;
         await redis.incr('metrics:jobs_done');
 
-        logger.info({ loopId, taskId: task.id }, 'task_completed');
+        logger.info({ loopId, taskId: task.id, correlationId: task.correlationId, latencyMs }, 'task_completed');
       } catch (err) {
         // Failure path
         jobsFailedLocal += 1;
@@ -193,6 +212,11 @@ async function workerLoop(loopId: number) {
           await redis.hset(taskKey, 'status', 'failed', 'lastError', errMsg);
           await redis.incr('metrics:jobs_dead_letter');
 
+          // Trigger AI analysis asynchronously
+          analyzeFailure(redis, exhaustedTask).catch(err =>
+            logger.error({ err, taskId: task.id }, 'ai_analysis_failed')
+          );
+
           logger.error({ loopId, taskId: task.id }, 'moved_to_dlq');
         }
       }
@@ -217,9 +241,16 @@ for (let i = 0; i < CONCURRENCY; i++) {
 const app = express();
 app.use(express.json({ limit: '64kb' }));
 
+// Helper to calculate percentile from sorted array
+function percentile(sorted: number[], p: number): number {
+  if (sorted.length === 0) return 0;
+  const idx = Math.ceil((p / 100) * sorted.length) - 1;
+  return sorted[Math.max(0, idx)];
+}
+
 app.get('/metrics', async (_req, res) => {
   try {
-    const [pending, processing, dead, delayed, jobsDone, jobsFailed, jobsRetried, jobsDead] =
+    const [pending, processing, dead, delayed, jobsDone, jobsFailed, jobsRetried, jobsDead, latencySamples] =
       await Promise.all([
         redis.llen('queue:pending'),
         redis.llen('queue:processing'),
@@ -228,8 +259,26 @@ app.get('/metrics', async (_req, res) => {
         redis.get('metrics:jobs_done'),
         redis.get('metrics:jobs_failed'),
         redis.get('metrics:jobs_retried'),
-        redis.get('metrics:jobs_dead_letter')
+        redis.get('metrics:jobs_dead_letter'),
+        redis.lrange('latency:samples', 0, 9999)
       ]);
+
+    // Calculate latency percentiles
+    let latency: { p50: number; p95: number; p99: number; min: number; max: number; mean: number; samples: number } | null = null;
+    if (latencySamples.length > 0) {
+      const nums = latencySamples.map(Number).filter(n => !isNaN(n)).sort((a, b) => a - b);
+      if (nums.length > 0) {
+        latency = {
+          p50: percentile(nums, 50),
+          p95: percentile(nums, 95),
+          p99: percentile(nums, 99),
+          min: nums[0],
+          max: nums[nums.length - 1],
+          mean: Math.round(nums.reduce((a, b) => a + b, 0) / nums.length),
+          samples: nums.length
+        };
+      }
+    }
 
     res.json({
       concurrency: CONCURRENCY,
@@ -241,7 +290,8 @@ app.get('/metrics', async (_req, res) => {
       jobs_done: Number(jobsDone ?? jobsDoneLocal),
       jobs_failed: Number(jobsFailed ?? jobsFailedLocal),
       jobs_retried: Number(jobsRetried ?? jobsRetriedLocal),
-      jobs_dead_letter: Number(jobsDead ?? 0)
+      jobs_dead_letter: Number(jobsDead ?? 0),
+      latency
     });
   } catch (err) {
     logger.error({ err }, 'metrics_error');
@@ -260,6 +310,96 @@ app.get('/dead_letter', async (req, res) => {
   } catch (err) {
     logger.error({ err }, 'dead_letter_error');
     res.status(500).json({ error: 'dead_letter_error' });
+  }
+});
+
+// Backpressure endpoint
+async function calculatePressure(): Promise<number> {
+  const pending = await redis.llen('queue:pending');
+  const processing = await redis.llen('queue:processing');
+  const maxCapacity = CONCURRENCY * 100;
+  return Math.min(100, Math.round(((pending + processing) / maxCapacity) * 100));
+}
+
+app.get('/pressure', async (_req, res) => {
+  try {
+    const score = await calculatePressure();
+    const pending = await redis.llen('queue:pending');
+    res.json({
+      pressure: score,
+      queueDepth: pending,
+      status: score > 80 ? 'critical' : score > 50 ? 'elevated' : 'normal',
+      recommendation: score > 80 ? 'throttle' : 'proceed'
+    });
+  } catch (err) {
+    logger.error({ err }, 'pressure_error');
+    res.status(500).json({ error: 'pressure_error' });
+  }
+});
+
+// Update backpressure score periodically
+setInterval(async () => {
+  if (!running) return;
+  try {
+    const score = await calculatePressure();
+    await redis.set('backpressure:score', String(score), 'EX', 10);
+  } catch (err) {
+    logger.error({ err }, 'pressure_update_error');
+  }
+}, 5000);
+
+// AI Analysis endpoints
+app.get('/dead_letter/:taskId/analysis', async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const analysis = await redis.hgetall(`ai:analysis:${taskId}`);
+
+    if (!analysis || Object.keys(analysis).length === 0) {
+      return res.status(404).json({ error: 'No analysis found for this task' });
+    }
+
+    res.json({
+      taskId,
+      rootCause: analysis.rootCause,
+      confidence: parseFloat(analysis.confidence),
+      suggestedFix: analysis.suggestedFix,
+      shouldRetry: analysis.shouldRetry === '1',
+      retryDelay: analysis.retryDelay ? parseInt(analysis.retryDelay) : null,
+      category: analysis.category,
+      provider: analysis.provider,
+      analyzedAt: parseInt(analysis.analyzedAt),
+      aiLatencyMs: parseInt(analysis.aiLatencyMs)
+    });
+  } catch (err) {
+    logger.error({ err }, 'ai_analysis_get_error');
+    res.status(500).json({ error: 'ai_analysis_get_error' });
+  }
+});
+
+app.get('/ai/patterns', async (req, res) => {
+  try {
+    const limit = Math.min(50, Number(req.query.limit as string) || 20);
+    const categories = ['transient', 'permanent', 'config'];
+    const patterns: Record<string, unknown[]> = {};
+
+    for (const cat of categories) {
+      const items = await redis.lrange(`ai:patterns:${cat}`, 0, limit - 1);
+      patterns[cat] = items.map(i => {
+        try { return JSON.parse(i); } catch { return { raw: i }; }
+      });
+    }
+
+    res.json({
+      patterns,
+      summary: {
+        transient: patterns.transient.length,
+        permanent: patterns.permanent.length,
+        config: patterns.config.length
+      }
+    });
+  } catch (err) {
+    logger.error({ err }, 'ai_patterns_error');
+    res.status(500).json({ error: 'ai_patterns_error' });
   }
 });
 
@@ -340,6 +480,7 @@ async function recoverProcessing(limit = 1000) {
       const serialized = serializeTask(taskObj);
       await redis.zadd('queue:delayed', nextRun, serialized);
       await redis.hset(key, 'data', serialized, 'status', 'scheduled');
+      await redis.incr('metrics:jobs_recovered');
       recovered++;
     } else {
       const data = await redis.hget(key, 'data') || raw;
