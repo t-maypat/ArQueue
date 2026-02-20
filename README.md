@@ -1,5 +1,10 @@
 # ArQueue - Distributed Task Queue
 
+![TypeScript](https://img.shields.io/badge/TypeScript-Redis--Queue-3178C6?logo=typescript&logoColor=white)
+![Redis](https://img.shields.io/badge/Redis-backed-queue-DC382D?logo=redis&logoColor=white)
+![Distributed](https://img.shields.io/badge/distributed-workers-success)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE.md)
+
 This is a  Redis-backed task queue implemented in TypeScript.
 It demonstrates real-world async patterns:
 reliable dequeue, retries with exponential backoff + jitter, delayed queue,
