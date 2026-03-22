@@ -19,6 +19,9 @@ A fault-tolerant, Redis-backed distributed task queue with AI-powered failure an
 
 ## Architecture
 
+<img width="1712" height="2653" alt="image" src="https://github.com/user-attachments/assets/456830b1-edab-44f3-94ee-61412c09345f" />
+
+
 ```
 ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
 │   Producer  │────▶│    Redis    │◀────│   Worker    │
