@@ -16,7 +16,7 @@ last run - **5,000+ jobs/min throughput**, **p95 latency of 35ms**, and **zero j
 | **p95 Latency** | 35ms | Unloaded, single task |
 | **Job Loss Rate** | 0% | Verified under chaos testing |
 | **Burst Handling** | 500 jobs in 5.5s | Peak queue depth 281 |
-| **AI Analysis** | ~4s response | Gemini/OpenAI/Anthropic/Ollama |
+<!--| **LLM Analysis** | ~xs response | Gemini/OpenAI/Anthropic/Ollama | -->
 
 ## Architecture
 
