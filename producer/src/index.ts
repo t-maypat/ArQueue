@@ -10,7 +10,6 @@ dotenv.config();
 
 const app = express();
 
-//body limit to avoid huge payload abuse
 app.use(express.json({ limit: '64kb' }));
 
 app.use((req, res, next) => {
